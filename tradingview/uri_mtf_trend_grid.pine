@@ -1,5 +1,5 @@
 //@version=6
-indicator("Uri Multi-TF Trend Grid v1.0", shorttitle="Uri MTF Grid", overlay=true, dynamic_requests=true)
+indicator("Uri Multi-TF Trend Grid v1.1", shorttitle="Uri MTF Grid", overlay=true, dynamic_requests=true)
 // Standalone multi-timeframe trend grid. Multi-X-style layout; original rules, not Maverick code.
 // Works on any symbol (crypto, futures, stocks). Best on a chart at or below the smallest grid timeframe.
 // Five different "traders" (T1-T5) each vote bullish, bearish or neutral on up to 7 timeframes.
@@ -145,10 +145,30 @@ int mxTotAvail = 0
 int mxTotCells = 0
 int mxHtfBullCols = 0
 int mxHtfBearCols = 0
+// Last good reading per column: 7 columns x (5 votes + source close time).
+var array<int> mxMemory = array.new<int>(42, na)
 if mxEnabled and mxChartOK
     for col = 0 to mxColumns - 1
         string tf = array.get(mxFrames, col)
-        [a, b, c, d, e, stamp] = mxRead(tf)
+        [ra, rb, rc, rd, re, rstamp] = mxRead(tf)
+        // Early in a chart candle no lower-timeframe candle has closed inside it yet
+        // (e.g. 2 minutes into a 15m candle there is no closed 3m/5m/10m candle).
+        // Fall back to the last reading this column had instead of showing N/A.
+        int base = col * 6
+        bool fresh = not na(rstamp)
+        int a = fresh ? ra : array.get(mxMemory, base)
+        int b = fresh ? rb : array.get(mxMemory, base + 1)
+        int c = fresh ? rc : array.get(mxMemory, base + 2)
+        int d = fresh ? rd : array.get(mxMemory, base + 3)
+        int e = fresh ? re : array.get(mxMemory, base + 4)
+        int stamp = fresh ? rstamp : array.get(mxMemory, base + 5)
+        if fresh
+            array.set(mxMemory, base, ra)
+            array.set(mxMemory, base + 1, rb)
+            array.set(mxMemory, base + 2, rc)
+            array.set(mxMemory, base + 3, rd)
+            array.set(mxMemory, base + 4, re)
+            array.set(mxMemory, base + 5, rstamp)
         array<int> votes = array.from(a, b, c, d, e)
         int bulls = 0
         int bears = 0
