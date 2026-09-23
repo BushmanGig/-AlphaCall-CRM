@@ -1,0 +1,204 @@
+//@version=6
+indicator("Uri Multi-TF Trend Grid v1.0", shorttitle="Uri MTF Grid", overlay=true, dynamic_requests=true)
+// Standalone multi-timeframe trend grid. Multi-X-style layout; original rules, not Maverick code.
+// Works on any symbol (crypto, futures, stocks). Best on a chart at or below the smallest grid timeframe.
+// Five different "traders" (T1-T5) each vote bullish, bearish or neutral on up to 7 timeframes.
+// The traders still all read the same price series, so their votes are related, not independent.
+// INSTALL/VALIDATION: not compiled inside TradingView in this environment.
+
+int ucFastLen = input.int(9, "T1 fast EMA", minval=1, group="Traders")
+int ucSlowLen = input.int(21, "T1 slow EMA", minval=2, group="Traders")
+int ucRsiLen = input.int(14, "T2 RSI length", minval=2, group="Traders")
+float ucRsiMargin = input.float(2, "T2 RSI margin either side of 50", minval=0, maxval=25, step=1, group="Traders")
+if barstate.isfirst and ucFastLen >= ucSlowLen
+    runtime.error("Fast EMA must be shorter than slow EMA.")
+bool mxChartOK = true
+
+// === MULTI-TIMEFRAME TREND GRID: Multi-X-style layout, original transparent rules ===
+// Five "traders", each looking at a different aspect of price, vote on every timeframe:
+//   T1 Trend       fast EMA vs slow EMA
+//   T2 Momentum    RSI outside its neutral band AND MACD histogram on the same side
+//   T3 Volume      close vs session VWAP (N/A on symbols without volume)
+//   T4 Structure   last break of the prior N-bar high (bull) or low (bear)
+//   T5 Volatility  Supertrend direction
+// Votes are technical readings, NOT probabilities, gamma exposure or trade instructions.
+bool mxEnabled = input.bool(true, "Show trend grid", group="Multi-timeframe grid")
+string mxStyle = input.string("Compact (colour only)", "Grid style", options=["Compact (colour only)", "Detailed"], tooltip="Compact shows solid cells with T1-T5 rows. Detailed adds trader names and +/-/0 text.", group="Multi-timeframe grid")
+bool mxForce = input.bool(false, "Green/red only (no neutral)", tooltip="Neutral readings are assigned to the side of the slow EMA. Cleaner to read, but hides genuinely mixed readings.", group="Multi-timeframe grid")
+bool mxSummary = input.bool(true, "Show bias rows", tooltip="Per-timeframe net score and an overall bullish/bearish cell count.", group="Multi-timeframe grid")
+string mxPos = input.string("Top right", "Grid position", options=["Top right", "Top left", "Middle right", "Bottom right", "Bottom left"], group="Multi-timeframe grid")
+int mxColumns = input.int(6, "Timeframes shown", minval=1, maxval=7, group="Multi-timeframe grid")
+string mxMode = input.string("Closed candles", "Reading mode", options=["Closed candles", "Live preview"], tooltip="Closed candles uses completed bars. Live preview updates every tick and can change before close. Lower timeframes always use the latest completed intrabar; unavailable data shows N/A.", group="Multi-timeframe grid")
+string mxTF1 = input.timeframe("1", "Timeframe 1", group="Multi-timeframe grid")
+string mxTF2 = input.timeframe("2", "Timeframe 2", group="Multi-timeframe grid")
+string mxTF3 = input.timeframe("3", "Timeframe 3", group="Multi-timeframe grid")
+string mxTF4 = input.timeframe("5", "Timeframe 4", group="Multi-timeframe grid")
+string mxTF5 = input.timeframe("10", "Timeframe 5", group="Multi-timeframe grid")
+string mxTF6 = input.timeframe("15", "Timeframe 6", group="Multi-timeframe grid")
+string mxTF7 = input.timeframe("60", "Timeframe 7", group="Multi-timeframe grid")
+int mxStructLen = input.int(20, "T4 structure lookback (bars)", minval=2, group="Multi-timeframe grid")
+float mxStFactor = input.float(3.0, "T5 Supertrend factor", minval=0.5, step=0.5, group="Multi-timeframe grid")
+int mxStAtr = input.int(10, "T5 Supertrend ATR length", minval=1, group="Multi-timeframe grid")
+float mxConsensus = input.float(80, "Strong consensus (% of cells)", minval=50, maxval=100, step=5, group="Multi-timeframe grid")
+int mxHtfCount = input.int(3, "Higher-TF alignment: last N columns", minval=1, maxval=7, group="Multi-timeframe grid")
+color mxBullColour = input.color(color.rgb(56, 118, 62), "Bullish cell", group="Multi-timeframe grid")
+color mxBearColour = input.color(color.rgb(235, 64, 82), "Bearish cell", group="Multi-timeframe grid")
+color mxFlatColour = input.color(color.rgb(90, 90, 100), "Neutral cell", group="Multi-timeframe grid")
+bool mxCompact = mxStyle == "Compact (colour only)"
+
+mxVotes() =>
+    float fast = ta.ema(close, ucFastLen)
+    float slow = ta.ema(close, ucSlowLen)
+    float r = ta.rsi(close, ucRsiLen)
+    [macd, signal, hist] = ta.macd(close, 12, 26, 9)
+    float vw = ta.vwap(hlc3)
+    float volSeen = ta.cum(nz(volume))
+    float priorHigh = ta.highest(high, mxStructLen)[1]
+    float priorLow = ta.lowest(low, mxStructLen)[1]
+    [st, direction] = ta.supertrend(mxStFactor, mxStAtr)
+    var int structure = 0
+    if not na(priorHigh) and close > priorHigh
+        structure := 1
+    else if not na(priorLow) and close < priorLow
+        structure := -1
+    int tie = na(slow) ? 0 : close > slow ? 1 : close < slow ? -1 : 0
+    int v1 = na(slow) ? na : fast > slow ? 1 : fast < slow ? -1 : 0
+    int v2 = na(r) or na(hist) ? na : r > 50 + ucRsiMargin and hist > 0 ? 1 : r < 50 - ucRsiMargin and hist < 0 ? -1 : 0
+    int v3 = na(vw) or volSeen == 0 ? na : close > vw ? 1 : close < vw ? -1 : 0
+    int v4 = na(priorHigh) ? na : structure
+    int v5 = na(st) ? na : direction < 0 ? 1 : direction > 0 ? -1 : 0
+    if mxForce
+        v1 := v1 == 0 ? tie : v1
+        v2 := v2 == 0 ? tie : v2
+        v3 := v3 == 0 ? tie : v3
+        v4 := v4 == 0 ? tie : v4
+        v5 := v5 == 0 ? tie : v5
+    [v1, v2, v3, v4, v5, time_close]
+
+mxPreviousVotes() =>
+    [a, b, c, d, e, t] = mxVotes()
+    [a[1], b[1], c[1], d[1], e[1], t[1]]
+
+// Chart-timeframe votes are computed ONCE per bar at global scope. Calling the stateful
+// ta.* functions inside the column loop would share one indicator state between columns
+// whenever more than one column resolves to the chart timeframe.
+[mxC1, mxC2, mxC3, mxC4, mxC5, mxCT] = mxVotes()
+bool mxHoldPrior = mxMode == "Closed candles" and not barstate.isconfirmed
+int mxCh1 = mxHoldPrior ? mxC1[1] : mxC1
+int mxCh2 = mxHoldPrior ? mxC2[1] : mxC2
+int mxCh3 = mxHoldPrior ? mxC3[1] : mxC3
+int mxCh4 = mxHoldPrior ? mxC4[1] : mxC4
+int mxCh5 = mxHoldPrior ? mxC5[1] : mxC5
+int mxChT = mxHoldPrior ? mxCT[1] : mxCT
+
+mxRead(string tf) =>
+    float targetSeconds = timeframe.in_seconds(tf)
+    float chartSeconds = timeframe.in_seconds()
+    if targetSeconds < chartSeconds
+        [aa, bb, cc, dd, ee, tt] = request.security_lower_tf(syminfo.tickerid, tf, mxVotes())
+        int idx = array.size(tt) - 1
+        // Never select a still-forming intrabar, even in live preview mode.
+        while idx >= 0
+            if array.get(tt, idx) <= timenow
+                break
+            idx -= 1
+        int a = idx >= 0 ? array.get(aa, idx) : na
+        int b = idx >= 0 ? array.get(bb, idx) : na
+        int c = idx >= 0 ? array.get(cc, idx) : na
+        int d = idx >= 0 ? array.get(dd, idx) : na
+        int e = idx >= 0 ? array.get(ee, idx) : na
+        int t = idx >= 0 ? array.get(tt, idx) : na
+        [a, b, c, d, e, t]
+    else if targetSeconds == chartSeconds
+        [mxCh1, mxCh2, mxCh3, mxCh4, mxCh5, mxChT]
+    else if mxMode == "Closed candles"
+        // One-bar offset + lookahead_on avoids leaking future HTF values.
+        request.security(syminfo.tickerid, tf, mxPreviousVotes(), lookahead=barmerge.lookahead_on)
+    else
+        request.security(syminfo.tickerid, tf, mxVotes(), lookahead=barmerge.lookahead_off)
+
+// "1" -> "1m", "60" -> "1h", "1D" stays "1D".
+mxFormat(string tf) =>
+    string raw = tf == "" ? timeframe.period : tf
+    float minutes = str.tonumber(raw)
+    na(minutes) ? raw : minutes % 60 == 0 ? str.tostring(minutes / 60, "#") + "h" : raw + "m"
+
+string mxPosition = mxPos == "Top left" ? position.top_left : mxPos == "Middle right" ? position.middle_right : mxPos == "Bottom right" ? position.bottom_right : mxPos == "Bottom left" ? position.bottom_left : position.top_right
+var table mxGrid = table.new(mxPosition, 8, 8, border_width=1, border_color=color.new(color.gray, 50), force_overlay=true)
+var array<string> mxFrames = array.from(mxTF1, mxTF2, mxTF3, mxTF4, mxTF5, mxTF6, mxTF7)
+var array<string> mxNames = array.from("T1 Trend", "T2 Momentum", "T3 Volume", "T4 Structure", "T5 Volatility")
+var array<string> mxTips = array.from("Trend: fast EMA versus slow EMA.", "Momentum: RSI beyond 50 +/- margin AND MACD (12,26,9) histogram on the same side; otherwise neutral.", "Volume: close above/below session VWAP. N/A when the symbol has no volume.", "Structure: most recent close beyond the prior N-bar high (bullish) or low (bearish).", "Volatility: Supertrend direction.")
+color mxHeader = color.rgb(29, 34, 46)
+if barstate.islast
+    table.clear(mxGrid, 0, 0, 7, 7)
+    if mxEnabled and mxChartOK
+        table.cell(mxGrid, 0, 0, mxCompact ? "Time Frame" : "Trend grid", bgcolor=mxHeader, text_color=color.white, text_size=size.small)
+        for row = 0 to 4
+            table.cell(mxGrid, 0, row + 1, mxCompact ? "T" + str.tostring(row + 1) : array.get(mxNames, row), bgcolor=mxHeader, text_color=color.white, text_size=size.small, tooltip=array.get(mxTips, row))
+        if mxSummary
+            table.cell(mxGrid, 0, 6, "Bias", bgcolor=mxHeader, text_color=color.white, text_size=size.small, tooltip="Bullish minus bearish votes on that timeframe. Not a win probability.")
+
+// Every bar: read each timeframe and tally votes (the tallies drive the alerts).
+int mxTotBull = 0
+int mxTotBear = 0
+int mxTotAvail = 0
+int mxTotCells = 0
+int mxHtfBullCols = 0
+int mxHtfBearCols = 0
+if mxEnabled and mxChartOK
+    for col = 0 to mxColumns - 1
+        string tf = array.get(mxFrames, col)
+        [a, b, c, d, e, stamp] = mxRead(tf)
+        array<int> votes = array.from(a, b, c, d, e)
+        int bulls = 0
+        int bears = 0
+        int available = 0
+        for vote in votes
+            available += na(vote) ? 0 : 1
+            bulls += vote == 1 ? 1 : 0
+            bears += vote == -1 ? 1 : 0
+        mxTotBull += bulls
+        mxTotBear += bears
+        mxTotAvail += available
+        mxTotCells += 5
+        if col >= mxColumns - mxHtfCount
+            mxHtfBullCols += bulls == 5 ? 1 : 0
+            mxHtfBearCols += bears == 5 ? 1 : 0
+        if barstate.islast
+            bool lowerTF = timeframe.in_seconds(tf) < timeframe.in_seconds()
+            string modeLabel = lowerTF ? "latest closed lower-TF candle" : mxMode == "Closed candles" ? "closed candle" : "live candle"
+            string tip = na(stamp) ? "No completed data available." : "Source candle closes " + str.format_time(stamp, "MM-dd HH:mm", "UTC") + " UTC (" + modeLabel + ")."
+            table.cell(mxGrid, col + 1, 0, mxFormat(tf), bgcolor=mxHeader, text_color=color.white, text_size=size.small, tooltip=tip)
+            for row = 0 to 4
+                int vote = array.get(votes, row)
+                color shade = na(vote) ? color.rgb(45, 45, 55) : vote == 1 ? mxBullColour : vote == -1 ? mxBearColour : mxFlatColour
+                string caption = na(vote) ? (mxCompact ? "" : "N/A") : mxCompact ? "" : vote == 1 ? "+" : vote == -1 ? "-" : "0"
+                table.cell(mxGrid, col + 1, row + 1, caption, width=mxCompact ? 3 : 0, bgcolor=shade, text_color=color.white, text_size=size.small, tooltip=array.get(mxTips, row) + " " + tip)
+            if mxSummary
+                int net = bulls - bears
+                color netShade = bulls >= 3 ? mxBullColour : bears >= 3 ? mxBearColour : mxFlatColour
+                table.cell(mxGrid, col + 1, 6, available == 0 ? "N/A" : (net > 0 ? "+" : "") + str.tostring(net), bgcolor=netShade, text_color=color.white, text_size=size.small, tooltip=str.tostring(bulls) + " bullish, " + str.tostring(bears) + " bearish, " + str.tostring(available) + " available.")
+
+int mxHtfNeed = math.min(mxHtfCount, mxColumns)
+float mxBullPct = mxTotAvail > 0 ? 100.0 * mxTotBull / mxTotAvail : na
+float mxBearPct = mxTotAvail > 0 ? 100.0 * mxTotBear / mxTotAvail : na
+bool mxAllBull = mxTotCells > 0 and mxTotBull == mxTotCells
+bool mxAllBear = mxTotCells > 0 and mxTotBear == mxTotCells
+bool mxStrongBull = mxTotAvail == mxTotCells and mxBullPct >= mxConsensus
+bool mxStrongBear = mxTotAvail == mxTotCells and mxBearPct >= mxConsensus
+bool mxHtfBull = mxHtfNeed > 0 and mxHtfBullCols == mxHtfNeed
+bool mxHtfBear = mxHtfNeed > 0 and mxHtfBearCols == mxHtfNeed
+
+if barstate.islast and mxEnabled and mxChartOK and mxSummary
+    string overall = mxTotBull > mxTotBear ? "BULL " + str.tostring(mxTotBull) : mxTotBear > mxTotBull ? "BEAR " + str.tostring(mxTotBear) : "MIXED"
+    color overallShade = mxTotBull > mxTotBear ? (mxStrongBull ? mxBullColour : color.new(mxBullColour, 55)) : mxTotBear > mxTotBull ? (mxStrongBear ? mxBearColour : color.new(mxBearColour, 55)) : mxFlatColour
+    table.cell(mxGrid, 0, 7, overall + " / " + str.tostring(mxTotAvail), bgcolor=overallShade, text_color=color.white, text_size=size.small, tooltip="Cells agreeing with the majority, out of all available cells. Solid colour = at least " + str.tostring(mxConsensus) + "% agreement. Not a win probability.")
+
+// Grid alerts fire once, on the close of the candle where the condition first becomes true.
+bool mxAlertOK = mxEnabled and mxChartOK and barstate.isconfirmed
+alertcondition(mxAlertOK and mxAllBull and not mxAllBull[1], title="Grid: every cell bullish", message="Every trader on every grid timeframe is bullish on {{ticker}}. Technical readings, not a probability.")
+alertcondition(mxAlertOK and mxAllBear and not mxAllBear[1], title="Grid: every cell bearish", message="Every trader on every grid timeframe is bearish on {{ticker}}. Technical readings, not a probability.")
+alertcondition(mxAlertOK and mxStrongBull and not mxStrongBull[1], title="Grid: strong bullish consensus", message="Trend grid reached strong bullish consensus on {{ticker}}.")
+alertcondition(mxAlertOK and mxStrongBear and not mxStrongBear[1], title="Grid: strong bearish consensus", message="Trend grid reached strong bearish consensus on {{ticker}}.")
+alertcondition(mxAlertOK and mxHtfBull and not mxHtfBull[1], title="Grid: higher timeframes aligned bullish", message="The highest grid timeframes are all fully bullish on {{ticker}}.")
+alertcondition(mxAlertOK and mxHtfBear and not mxHtfBear[1], title="Grid: higher timeframes aligned bearish", message="The highest grid timeframes are all fully bearish on {{ticker}}.")
