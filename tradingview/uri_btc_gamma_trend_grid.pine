@@ -1,0 +1,356 @@
+//@version=6
+indicator("Uri BTC Gamma + Trend Grid v1.5", overlay=true, dynamic_requests=true, max_lines_count=10, max_labels_count=10)
+// Original importer, not Maverick code. No external HTTP requests or gamma calculation.
+// Paste into Pine Editor, save, Add to chart on BTCUSDT (e.g. MEXC).
+// Settings: paste ONE flat JSON object, then update snapshot time and scope.
+// Accepts this conversation's normalized schema, NOT arbitrary vendor API output.
+// Flat strings must not contain commas, colons, braces or escaped characters.
+// Missing/null numeric levels remain absent, never zero. Required: BTC, date, spot,
+// net_gex_dollars, gamma_regime. One source/model/horizon per indicator instance.
+// Defaults: user-supplied, independently UNVERIFIED, approx 2026-09-17 03:17 UTC.
+// Raw Deribit USD levels on a BTC USD/USDT chart: no exchange/basis conversion.
+// Timestamp is entered separately because the supplied JSON only has a date.
+// Lines begin at that timestamp and expire. No lines before snapshot availability.
+// Replacing JSON replaces the snapshot; this does not build a historical archive.
+// Whole-book walls must not be reused as near-expiry walls without matching data.
+// For near-expiry scope: supply that scope's GEX/flip and null unknown walls.
+// Vol trigger/absolute gamma and contracts/OI are optional.
+// Optional original price-based candle filter; independent of gamma snapshots.
+// Gamma levels are BTC-only; candles, arrows and the trend grid work on any intraday chart.
+// INSTALL/VALIDATION: not compiled inside TradingView in this environment.
+
+string payload = input.text_area("{\n  \"date\": \"2026-09-17\",\n  \"symbol\": \"BTC\",\n  \"spot\": 76384,\n  \"net_gex_dollars\": 166500000,\n  \"zero_gamma_flip\": 74083,\n  \"call_wall\": 80000,\n  \"put_wall\": 75000,\n  \"vol_trigger\": null,\n  \"abs_gamma_strike\": null,\n  \"gamma_regime\": \"positive\",\n  \"oi_settle_date\": null,\n  \"contracts_analyzed\": 790,\n  \"source\": \"indiciadesk_deribit\"\n}", "Normalized BTC JSON", group="Snapshot")
+int asof = input.time(timestamp("17 Sep 2026 03:17 +0000"), "Snapshot available at (update with JSON)", group="Snapshot")
+string scope = input.string("Whole book", "Expiry horizon of ALL supplied fields", options=["Whole book", "<= 2d", "<= 7d", "<= 14d", "<= 30d", "Other"], group="Snapshot")
+float lifeHours = input.float(24, "Display validity (hours; not a freshness guarantee)", minval=0.25, maxval=168, step=0.25, group="Snapshot")
+bool showTags = input.bool(true, "Show labels", group="Visuals")
+int width = input.int(2, "Line width", minval=1, maxval=4, group="Visuals")
+bool enableAlerts = input.bool(false, "Enable confirmed-bar touch alerts", group="Alerts")
+
+var map<string, string> fields = map.new<string, string>()
+getText(string key) =>
+    map.contains(fields, key) ? map.get(fields, key) : ""
+getNum(string key) =>
+    string raw = getText(key)
+    float value = raw == "" or raw == "null" ? na : str.tonumber(raw)
+    if raw != "" and raw != "null" and na(value)
+        runtime.error("Expected number or null for " + key)
+    value
+
+var array<float> levels = array.new<float>()
+var array<string> names = array.from("CALL WALL", "PUT WALL", "GAMMA FLIP", "VOL TRIGGER", "ABS GAMMA")
+var array<color> colours = array.from(color.rgb(255, 87, 34), color.lime, color.yellow, color.aqua, color.fuchsia)
+var float spot = na
+var float gex = na
+var string regime = ""
+var string source = ""
+if barstate.isfirst
+    string jsonText = str.trim(payload)
+    if not str.startswith(jsonText, "{") or not str.endswith(jsonText, "}")
+        runtime.error("Paste one flat JSON object, including braces, without Markdown fences.")
+    string inner = str.substring(jsonText, 1, str.length(jsonText) - 1)
+    array<string> pairs = str.split(inner, ",")
+    if array.size(pairs) > 30
+        runtime.error("Expected one normalized snapshot, not nested data or history.")
+    for pair in pairs
+        array<string> kv = str.split(pair, ":")
+        if array.size(kv) != 2
+            runtime.error("Flat JSON only: no commas or colons inside string values.")
+        string keyRaw = str.trim(array.get(kv, 0))
+        string valRaw = str.trim(array.get(kv, 1))
+        if not str.startswith(keyRaw, '"') or not str.endswith(keyRaw, '"')
+            runtime.error("JSON field names must be double-quoted.")
+        string key = str.substring(keyRaw, 1, str.length(keyRaw) - 1)
+        string val = valRaw
+        if str.startswith(valRaw, '"') and str.endswith(valRaw, '"')
+            val := str.substring(valRaw, 1, str.length(valRaw) - 1)
+        if str.contains(val, "{") or str.contains(val, "}") or str.contains(val, "[") or str.contains(val, "]") or str.contains(val, '"') or str.contains(val, "\\")
+            runtime.error("Nested JSON and escaped strings are unsupported.")
+        if map.contains(fields, key)
+            runtime.error("Duplicate field: " + key)
+        map.put(fields, key, val)
+    if getText("symbol") != "BTC"
+        runtime.error("This importer requires symbol BTC. Use the separate importer for SPX.")
+    if getText("date") != str.format_time(asof, "yyyy-MM-dd", "UTC")
+        runtime.error("JSON date must match the snapshot's UTC date. Update the timestamp input.")
+    spot := getNum("spot")
+    gex := getNum("net_gex_dollars")
+    regime := getText("gamma_regime")
+    source := getText("source")
+    if na(spot) or spot <= 0 or na(gex)
+        runtime.error("Positive spot and numeric net_gex_dollars are required.")
+    if regime != "positive" and regime != "negative" and regime != "neutral"
+        runtime.error("gamma_regime must be positive, negative or neutral.")
+    if source == "" or source == "null"
+        source := "Unspecified source"
+    array.push(levels, getNum("call_wall"))
+    array.push(levels, getNum("put_wall"))
+    array.push(levels, getNum("zero_gamma_flip"))
+    array.push(levels, getNum("vol_trigger"))
+    array.push(levels, getNum("abs_gamma_strike"))
+    int available = 0
+    for v in levels
+        if not na(v)
+            if v <= 0
+                runtime.error("Price levels must be positive or null.")
+            available += 1
+    if available == 0
+        runtime.error("No price levels were supplied.")
+
+bool correctChart = syminfo.basecurrency == "BTC" and (syminfo.currency == "USD" or syminfo.currency == "USDT")
+int expires = asof + int(lifeHours * 3600000)
+bool validBar = correctChart and timeframe.isintraday and time >= asof and time_close <= expires
+// Live alerts also require the wall clock to be within the snapshot interval.
+bool validLive = validBar and timenow >= asof and timenow < expires
+bool touched = false
+if validBar
+    for v in levels
+        if not na(v) and low <= v and high >= v
+            touched := true
+if enableAlerts and validLive and barstate.isrealtime and barstate.isconfirmed and touched
+    alert("BTC " + scope + ": price touched a supplied gamma level. Source " + source + ". Snapshot " + str.format_time(asof, "yyyy-MM-dd HH:mm", "UTC") + " UTC.", alert.freq_once_per_bar_close)
+
+var array<line> drawings = array.new<line>()
+var array<label> labels = array.new<label>()
+var table panel = table.new(position.bottom_right, 1, 7, bgcolor=color.rgb(24, 28, 40))
+if barstate.islast
+    for item in drawings
+        line.delete(item)
+    array.clear(drawings)
+    for item in labels
+        label.delete(item)
+    array.clear(labels)
+    int reference = barstate.isrealtime ? timenow : time_close
+    bool before = reference < asof
+    bool stale = reference >= expires
+    bool visible = correctChart and timeframe.isintraday and not before
+    // Historical line segment remains visible after expiry, but stops at expiry.
+    // Labels say EXPIRED when the chart's current reference exceeds validity.
+    if visible
+        int endpoint = math.min(reference, expires)
+        for i = 0 to array.size(levels) - 1
+            float v = array.get(levels, i)
+            if not na(v)
+                color c = array.get(colours, i)
+                array.push(drawings, line.new(asof, v, endpoint, v, xloc=xloc.bar_time, color=c, width=width, style=i == 2 ? line.style_dashed : i == 3 ? line.style_dotted : line.style_solid))
+                if showTags
+                    array.push(labels, label.new(endpoint, v, array.get(names, i) + " " + str.tostring(v, format.mintick) + " | " + scope + (stale ? " | EXPIRED" : ""), xloc=xloc.bar_time, style=label.style_label_left, color=color.new(c, 85), textcolor=c, size=size.small))
+    string state = not correctChart ? "Gamma: BTC USD/USDT only" : not timeframe.isintraday ? "Use an intraday chart" : before ? "Snapshot is later than this bar" : stale ? "EXPIRED snapshot: paste an update" : "Pasted snapshot; NOT a live feed"
+    table.cell(panel, 0, 0, "URI BTC GAMMA | " + scope, text_color=color.white)
+    table.cell(panel, 0, 1, state, text_color=color.orange)
+    table.cell(panel, 0, 2, source, text_color=color.silver)
+    table.cell(panel, 0, 3, str.format_time(asof, "yyyy-MM-dd HH:mm", "UTC") + " UTC | " + regime, text_color=color.white)
+    table.cell(panel, 0, 4, "GEX " + str.tostring(gex / 1000000, "#.##") + "M USD / 1% | Ref " + str.tostring(spot, "#.##"), text_color=color.white)
+    table.cell(panel, 0, 5, "Raw source levels; no MEXC basis adjustment", text_color=color.silver)
+    table.cell(panel, 0, 6, "User-supplied model values; not independently verified", text_color=color.silver)
+
+// === Original Maverick-style candle colours (price-based approximation) ===
+// Independent of gamma inputs. Not Maverick AI Pro and not an options-flow model.
+// Bright green/pink require full confirmation; dark green/red indicate weaker trend.
+// Default: the open candle remains grey until it closes.
+bool ucEnabled = input.bool(true, "Enable candle colours", group="Candle colouring")
+bool ucClosedOnly = input.bool(true, "Confirm colours at candle close", group="Candle colouring")
+int ucFastLen = input.int(9, "Fast EMA", minval=1, group="Candle colouring")
+int ucSlowLen = input.int(21, "Slow EMA", minval=2, group="Candle colouring")
+int ucDmiLen = input.int(14, "DMI length", minval=2, group="Candle colouring")
+int ucAdxLen = input.int(14, "ADX smoothing", minval=2, group="Candle colouring")
+float ucAdxMin = input.float(18, "Minimum ADX", minval=0, step=1, group="Candle colouring")
+float ucGapMin = input.float(0.10, "Minimum EMA separation / ATR", minval=0, step=0.05, group="Candle colouring")
+int ucSlopeBars = input.int(3, "Slope lookback", minval=1, group="Candle colouring")
+float ucSlopeMin = input.float(0.03, "Minimum slow EMA slope / ATR per bar", minval=0, step=0.01, group="Candle colouring")
+int ucRsiLen = input.int(14, "RSI length", minval=2, group="Candle colouring")
+float ucRsiMargin = input.float(2, "RSI margin either side of 50", minval=0, maxval=25, step=1, group="Candle colouring")
+bool ucShowBaseline = input.bool(true, "Show blue slow EMA", group="Candle colouring")
+color ucBullColour = input.color(color.rgb(30, 230, 60), "Bullish colour", group="Candle colouring")
+color ucBearColour = input.color(color.rgb(245, 0, 205), "Bearish colour", group="Candle colouring")
+color ucNeutralColour = input.color(color.rgb(145, 145, 145), "Neutral colour", group="Candle colouring")
+
+if barstate.isfirst and ucFastLen >= ucSlowLen
+    runtime.error("Candle colouring: Fast EMA must be shorter than Slow EMA.")
+
+float ucFast = ta.ema(close, ucFastLen)
+float ucSlow = ta.ema(close, ucSlowLen)
+float ucAtr = ta.atr(14)
+float ucRsi = ta.rsi(close, ucRsiLen)
+[ucPlusDI, ucMinusDI, ucAdx] = ta.dmi(ucDmiLen, ucAdxLen)
+float ucGap = ucAtr > 0 ? math.abs(ucFast - ucSlow) / ucAtr : 0
+float ucSlope = ucAtr > 0 ? (ucSlow - ucSlow[ucSlopeBars]) / (ucAtr * ucSlopeBars) : 0
+bool ucReady = not na(ucAdx) and not na(ucRsi) and not na(ucSlow[ucSlopeBars]) and ucAtr > 0
+bool ucTrend = ucReady and ucAdx >= ucAdxMin and ucGap >= ucGapMin
+bool ucBull = ucTrend and ucFast > ucSlow and close > ucFast and ucSlope > ucSlopeMin and ucPlusDI > ucMinusDI and ucRsi > 50 + ucRsiMargin
+bool ucBear = ucTrend and ucFast < ucSlow and close < ucFast and ucSlope < -ucSlopeMin and ucMinusDI > ucPlusDI and ucRsi < 50 - ucRsiMargin
+int ucRawState = ucBull ? 1 : ucBear ? -1 : 0
+int ucState = ucClosedOnly and not barstate.isconfirmed ? 0 : ucRawState
+// Price-based visuals do not depend on the BTC gamma snapshot, so any intraday symbol works.
+bool ucChartOK = timeframe.isintraday
+// === Trend visuals v1.3: original rules, not Maverick's proprietary formula ===
+// Guide: slow EMA. Cloud: ribbon between fast and slow EMAs.
+// Direction: price vs guide + guide slope + EMA alignment.
+// Strong candles additionally require the existing ADX, DMI and RSI filters.
+// These features use chart prices, not the manually supplied gamma data.
+bool uvCandles = input.bool(true, "Strength candles", group="Trend visuals")
+bool uvCloud = input.bool(true, "Trend cloud", group="Trend visuals")
+bool uvBackground = input.bool(true, "Trend background", group="Trend visuals")
+bool uvArrows = input.bool(true, "Confidence arrows", group="Trend visuals")
+string uvArrowMode = input.string("Start and pullback", "Arrow frequency", options=["Start and pullback", "Every strong candle"], group="Trend visuals")
+int uvCooldown = input.int(3, "Minimum bars between arrows", minval=1, group="Trend visuals")
+int uvBgFade = input.int(80, "Background transparency", minval=0, maxval=100, group="Trend visuals")
+int uvCloudFade = input.int(78, "Cloud transparency", minval=0, maxval=100, group="Trend visuals")
+color uvWeakBull = input.color(color.rgb(0, 110, 20), "Weaker bullish candles", group="Trend visuals")
+color uvWeakBear = input.color(color.red, "Weaker bearish candles", group="Trend visuals")
+
+bool uvActive = ucEnabled and ucChartOK
+bool uvCanShow = not ucClosedOnly or barstate.isconfirmed
+bool uvUp = ucReady and close > ucSlow and ucFast > ucSlow and ucSlope > ucSlopeMin
+bool uvDown = ucReady and close < ucSlow and ucFast < ucSlow and ucSlope < -ucSlopeMin
+int uvRawDirection = uvUp ? 1 : uvDown ? -1 : 0
+int uvDirection = uvCanShow ? uvRawDirection : 0
+color uvDirectionColour = uvDirection == 1 ? uvWeakBull : uvDirection == -1 ? uvWeakBear : ucNeutralColour
+color uvCandleColour = ucState == 1 ? ucBullColour : ucState == -1 ? ucBearColour : uvDirectionColour
+barcolor(uvActive and uvCandles ? uvCandleColour : na, title="Strength candles")
+bgcolor(uvActive and uvBackground and uvDirection != 0 ? color.new(uvDirectionColour, uvBgFade) : na, title="Trend background")
+
+// In close-confirmed mode, hold the last completed guide/ribbon values on the open bar.
+float uvGuide = uvCanShow ? ucSlow : ucSlow[1]
+float uvFast = uvCanShow ? ucFast : ucFast[1]
+plot(uvActive and ucShowBaseline ? uvGuide : na, title="Blue trend guide (slow EMA)", color=color.rgb(0, 155, 255), linewidth=2)
+uvCloudFast = plot(uvActive and uvCloud ? uvFast : na, title="Cloud fast edge", color=color.new(color.white, 100), display=display.none)
+uvCloudSlow = plot(uvActive and uvCloud ? uvGuide : na, title="Cloud slow edge", color=color.new(color.white, 100), display=display.none)
+fill(uvCloudFast, uvCloudSlow, color=uvActive and uvCloud and uvDirection != 0 ? color.new(uvDirectionColour, uvCloudFade) : na, title="Trend cloud", fillgaps=false)
+
+// A confidence arrow is a rule confirmation, not a probability or trade instruction.
+// Pullback: wick touches the fast EMA and the candle closes back on the trend side.
+bool uvBullPullback = low <= ucFast and close > ucFast and close > open
+bool uvBearPullback = high >= ucFast and close < ucFast and close < open
+bool uvBullCandidate = ucRawState == 1 and (uvArrowMode == "Every strong candle" or nz(ucRawState[1], 0) != 1 or uvBullPullback)
+bool uvBearCandidate = ucRawState == -1 and (uvArrowMode == "Every strong candle" or nz(ucRawState[1], 0) != -1 or uvBearPullback)
+var int uvLastArrow = na
+bool uvGapOK = na(uvLastArrow) or bar_index - uvLastArrow >= uvCooldown
+// Arrows and alerts ALWAYS wait for bar close, even when preview colours are enabled.
+bool uvBullArrow = uvActive and uvArrows and barstate.isconfirmed and uvGapOK and uvBullCandidate
+bool uvBearArrow = uvActive and uvArrows and barstate.isconfirmed and uvGapOK and uvBearCandidate
+if uvBullArrow or uvBearArrow
+    uvLastArrow := bar_index
+plotshape(uvBullArrow, title="Bullish confidence arrow", style=shape.arrowup, location=location.belowbar, color=ucBullColour, size=size.small)
+plotshape(uvBearArrow, title="Bearish confidence arrow", style=shape.arrowdown, location=location.abovebar, color=ucBearColour, size=size.small)
+alertcondition(uvBullArrow, title="Bullish confidence arrow", message="Bullish trend/momentum confirmation on {{ticker}} {{interval}}. Price-based rules, not gamma flow.")
+alertcondition(uvBearArrow, title="Bearish confidence arrow", message="Bearish trend/momentum confirmation on {{ticker}} {{interval}}. Price-based rules, not gamma flow.")
+alertcondition(uvActive and barstate.isconfirmed and ucRawState == 1 and nz(ucRawState[1], 0) != 1, title="Bullish candle state begins", message="Original candle filter turned bullish on {{ticker}} {{interval}}.")
+alertcondition(uvActive and barstate.isconfirmed and ucRawState == -1 and nz(ucRawState[1], 0) != -1, title="Bearish candle state begins", message="Original candle filter turned bearish on {{ticker}} {{interval}}.")
+
+// MULTI-TIMEFRAME GRID: original transparent rules, not Maverick formulas.
+// Votes are correlated technical readings, NOT probabilities or gamma exposure.
+bool mxEnabled = input.bool(true, "Show trend grid", group="Multi-timeframe grid")
+string mxStyle = input.string("Compact (colour only)", "Grid style", options=["Compact (colour only)", "Detailed"], tooltip="Compact shows solid green/red/grey cells with T1-T5 rows. Detailed adds rule names, +/-/0 text, vote totals and reading mode.", group="Multi-timeframe grid")
+int mxColumns = input.int(6, "Timeframes shown", minval=1, maxval=7, group="Multi-timeframe grid")
+string mxMode = input.string("Closed candles", "Reading mode", options=["Closed candles", "Live preview"], tooltip="Closed candles uses completed bars. Live preview can change before close. Lower timeframes always use the latest available completed intrabar; unavailable data shows N/A.", group="Multi-timeframe grid")
+string mxTF1 = input.timeframe("1", "Timeframe 1", group="Multi-timeframe grid")
+string mxTF2 = input.timeframe("2", "Timeframe 2", group="Multi-timeframe grid")
+string mxTF3 = input.timeframe("3", "Timeframe 3", group="Multi-timeframe grid")
+string mxTF4 = input.timeframe("5", "Timeframe 4", group="Multi-timeframe grid")
+string mxTF5 = input.timeframe("10", "Timeframe 5", group="Multi-timeframe grid")
+string mxTF6 = input.timeframe("15", "Timeframe 6", group="Multi-timeframe grid")
+string mxTF7 = input.timeframe("60", "Timeframe 7", group="Multi-timeframe grid")
+bool mxCompact = mxStyle == "Compact (colour only)"
+// EMA, RSI and DMI reuse the candle settings, independently of gamma validity.
+mxVotes() =>
+    float fast = ta.ema(close, ucFastLen)
+    float slow = ta.ema(close, ucSlowLen)
+    float r = ta.rsi(close, ucRsiLen)
+    [macd, signal, hist] = ta.macd(close, 12, 26, 9)
+    [plus, minus, adx] = ta.dmi(ucDmiLen, ucAdxLen)
+    [st, direction] = ta.supertrend(3.0, 10)
+    int v1 = na(slow) ? na : fast > slow ? 1 : fast < slow ? -1 : 0
+    int v2 = na(r) ? na : r > 50 + ucRsiMargin ? 1 : r < 50 - ucRsiMargin ? -1 : 0
+    int v3 = na(hist) ? na : hist > 0 ? 1 : hist < 0 ? -1 : 0
+    int v4 = na(adx) or na(plus) or na(minus) ? na : adx < ucAdxMin ? 0 : plus > minus ? 1 : plus < minus ? -1 : 0
+    int v5 = na(st) ? na : direction < 0 ? 1 : direction > 0 ? -1 : 0
+    [v1, v2, v3, v4, v5, time_close]
+
+mxPreviousVotes() =>
+    [a, b, c, d, e, t] = mxVotes()
+    [a[1], b[1], c[1], d[1], e[1], t[1]]
+
+// Chart-timeframe votes are computed ONCE per bar at global scope. Calling the stateful
+// ta.* functions inside the column loop would share one EMA/RSI state between columns
+// whenever more than one column resolves to the chart timeframe.
+[mxC1, mxC2, mxC3, mxC4, mxC5, mxCT] = mxVotes()
+bool mxHoldPrior = mxMode == "Closed candles" and not barstate.isconfirmed
+int mxCh1 = mxHoldPrior ? mxC1[1] : mxC1
+int mxCh2 = mxHoldPrior ? mxC2[1] : mxC2
+int mxCh3 = mxHoldPrior ? mxC3[1] : mxC3
+int mxCh4 = mxHoldPrior ? mxC4[1] : mxC4
+int mxCh5 = mxHoldPrior ? mxC5[1] : mxC5
+int mxChT = mxHoldPrior ? mxCT[1] : mxCT
+
+mxRead(string tf) =>
+    float targetSeconds = timeframe.in_seconds(tf)
+    float chartSeconds = timeframe.in_seconds()
+    if targetSeconds < chartSeconds
+        [aa, bb, cc, dd, ee, tt] = request.security_lower_tf(syminfo.tickerid, tf, mxVotes())
+        int idx = array.size(tt) - 1
+        // Never select a still-forming intrabar, even in live preview mode.
+        while idx >= 0
+            if array.get(tt, idx) <= timenow
+                break
+            idx -= 1
+        int a = idx >= 0 ? array.get(aa, idx) : na
+        int b = idx >= 0 ? array.get(bb, idx) : na
+        int c = idx >= 0 ? array.get(cc, idx) : na
+        int d = idx >= 0 ? array.get(dd, idx) : na
+        int e = idx >= 0 ? array.get(ee, idx) : na
+        int t = idx >= 0 ? array.get(tt, idx) : na
+        [a, b, c, d, e, t]
+    else if targetSeconds == chartSeconds
+        [mxCh1, mxCh2, mxCh3, mxCh4, mxCh5, mxChT]
+    else if mxMode == "Closed candles"
+        // One-bar offset + lookahead_on avoids leaking future HTF values.
+        request.security(syminfo.tickerid, tf, mxPreviousVotes(), lookahead=barmerge.lookahead_on)
+    else
+        request.security(syminfo.tickerid, tf, mxVotes(), lookahead=barmerge.lookahead_off)
+
+// "1" -> "1m", "60" -> "1h", "1D" stays "1D".
+mxFormat(string tf) =>
+    string raw = tf == "" ? timeframe.period : tf
+    float minutes = str.tonumber(raw)
+    na(minutes) ? raw : minutes % 60 == 0 ? str.tostring(minutes / 60, "#") + "h" : raw + "m"
+
+var table mxGrid = table.new(position.top_right, 8, 8, border_width=1, border_color=color.new(color.gray, 50))
+var array<string> mxFrames = array.from(mxTF1, mxTF2, mxTF3, mxTF4, mxTF5, mxTF6, mxTF7)
+var array<string> mxNames = array.from("T1 EMA", "T2 RSI", "T3 MACD", "T4 DMI", "T5 Supertrend")
+var array<string> mxTips = array.from("Fast EMA versus slow EMA; lengths from candle settings.", "RSI above/below 50 plus/minus the candle RSI margin; neutral inside band.", "MACD (12,26,9) histogram above/below zero.", "DI+ versus DI-; neutral when ADX is below the candle ADX threshold.", "Supertrend (factor 3, ATR 10) direction.")
+color mxHeader = color.rgb(29, 34, 46)
+if barstate.islast
+    table.clear(mxGrid, 0, 0, 7, 7)
+    if mxEnabled and ucChartOK
+        table.cell(mxGrid, 0, 0, mxCompact ? "Time Frame" : "Trend grid", bgcolor=mxHeader, text_color=color.white, text_size=size.small)
+        for row = 0 to 4
+            table.cell(mxGrid, 0, row + 1, mxCompact ? "T" + str.tostring(row + 1) : array.get(mxNames, row), bgcolor=mxHeader, text_color=color.white, text_size=size.small, tooltip=array.get(mxTips, row))
+        if not mxCompact
+            table.cell(mxGrid, 0, 6, "Votes + / -", bgcolor=mxHeader, text_color=color.white, text_size=size.small, tooltip="Bullish and bearish rule counts, not a win probability.")
+            table.cell(mxGrid, 0, 7, mxMode == "Closed candles" ? "CLOSED" : "PREVIEW", bgcolor=mxHeader, text_color=color.orange, text_size=size.small)
+// Requests execute across history to initialize every selected data context.
+if mxEnabled and ucChartOK
+    for col = 0 to mxColumns - 1
+        string tf = array.get(mxFrames, col)
+        [a, b, c, d, e, stamp] = mxRead(tf)
+        if barstate.islast
+            bool lowerTF = timeframe.in_seconds(tf) < timeframe.in_seconds()
+            string modeLabel = lowerTF ? "LTF closed" : mxMode == "Closed candles" ? "Closed" : "Live"
+            string tip = na(stamp) ? "No completed data available." : "Source candle closes: " + str.format_time(stamp, "MM-dd HH:mm", "UTC") + " UTC. " + modeLabel
+            table.cell(mxGrid, col + 1, 0, mxFormat(tf), bgcolor=mxHeader, text_color=color.white, text_size=size.small, tooltip="Timeframe. " + tip)
+            array<int> votes = array.from(a, b, c, d, e)
+            int bulls = 0
+            int bears = 0
+            int available = 0
+            for row = 0 to 4
+                int vote = array.get(votes, row)
+                available += na(vote) ? 0 : 1
+                bulls += vote == 1 ? 1 : 0
+                bears += vote == -1 ? 1 : 0
+                color shade = na(vote) ? color.rgb(45, 45, 55) : vote == 1 ? color.rgb(35, 110, 50) : vote == -1 ? color.rgb(200, 40, 70) : color.rgb(90, 90, 100)
+                string caption = mxCompact ? "" : na(vote) ? "N/A" : vote == 1 ? "+" : vote == -1 ? "-" : "0"
+                table.cell(mxGrid, col + 1, row + 1, caption, width=mxCompact ? 3 : 0, bgcolor=shade, text_color=color.white, text_size=size.small, tooltip=array.get(mxTips, row) + " " + tip)
+            if not mxCompact
+                table.cell(mxGrid, col + 1, 6, available < 5 ? "N/A" : str.tostring(bulls) + " / " + str.tostring(bears), bgcolor=mxHeader, text_color=color.white, text_size=size.small)
+                table.cell(mxGrid, col + 1, 7, modeLabel, bgcolor=mxHeader, text_color=color.silver, text_size=size.tiny, tooltip=tip)
