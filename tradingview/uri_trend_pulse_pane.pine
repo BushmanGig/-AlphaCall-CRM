@@ -1,0 +1,81 @@
+//@version=6
+indicator("Uri Trend Pulse v1.0", overlay=false, max_labels_count=5)
+// Companion pane for "Uri BTC Gamma + Trend Grid". Original rules, not Maverick code.
+// Plots the SAME trend direction that colours the main script's background:
+//   UP   = close above slow EMA, fast EMA above slow EMA, slow EMA rising.
+//   DOWN = the mirror image. Otherwise NEUTRAL.
+// Keep the settings below identical to the main script's "Candle colouring" group,
+// or the pane and the chart background will disagree.
+// Price-based trend state only: not a probability, gamma reading or trade instruction.
+// INSTALL/VALIDATION: not compiled inside TradingView in this environment.
+
+int fastLen = input.int(9, "Fast EMA", minval=1, group="Match main script")
+int slowLen = input.int(21, "Slow EMA", minval=2, group="Match main script")
+int dmiLen = input.int(14, "DMI length", minval=2, group="Match main script")
+int adxLen = input.int(14, "ADX smoothing", minval=2, group="Match main script")
+float adxMin = input.float(18, "Minimum ADX", minval=0, step=1, group="Match main script")
+float gapMin = input.float(0.10, "Minimum EMA separation / ATR", minval=0, step=0.05, group="Match main script")
+int slopeBars = input.int(3, "Slope lookback", minval=1, group="Match main script")
+float slopeMin = input.float(0.03, "Minimum slow EMA slope / ATR per bar", minval=0, step=0.01, group="Match main script")
+int rsiLen = input.int(14, "RSI length", minval=2, group="Match main script")
+float rsiMargin = input.float(2, "RSI margin either side of 50", minval=0, maxval=25, step=1, group="Match main script")
+bool closedOnly = input.bool(true, "Confirm at candle close", tooltip="While a candle is open, keep showing the last closed candle's state.", group="Match main script")
+
+bool showStrength = input.bool(false, "Lower pulse for weaker trend", tooltip="Off: every trend reaches the top level, like the reference pane. On: only trends that also pass the ADX, DMI and RSI filters (bright candles) reach the top level.", group="Display")
+float topLevel = input.float(50, "Trend level", minval=1, group="Display")
+float weakLevel = input.float(30, "Weaker trend level", minval=1, group="Display")
+bool showLabel = input.bool(true, "Show state label", group="Display")
+bool showBaseline = input.bool(true, "Show red baseline", group="Display")
+color upColour = input.color(color.rgb(76, 175, 80), "Uptrend", group="Display")
+color downColour = input.color(color.rgb(242, 54, 69), "Downtrend", group="Display")
+color flatColour = input.color(color.rgb(120, 123, 134), "Neutral", group="Display")
+
+if barstate.isfirst and fastLen >= slowLen
+    runtime.error("Fast EMA must be shorter than Slow EMA.")
+
+// Same calculations as the main script's candle-colouring section.
+float fast = ta.ema(close, fastLen)
+float slow = ta.ema(close, slowLen)
+float atr = ta.atr(14)
+float rsi = ta.rsi(close, rsiLen)
+[plusDI, minusDI, adx] = ta.dmi(dmiLen, adxLen)
+float gap = atr > 0 ? math.abs(fast - slow) / atr : 0
+float slope = atr > 0 ? (slow - slow[slopeBars]) / (atr * slopeBars) : 0
+bool ready = not na(adx) and not na(rsi) and not na(slow[slopeBars]) and atr > 0
+bool strongTrend = ready and adx >= adxMin and gap >= gapMin
+bool up = ready and close > slow and fast > slow and slope > slopeMin
+bool down = ready and close < slow and fast < slow and slope < -slopeMin
+bool strongUp = up and strongTrend and close > fast and plusDI > minusDI and rsi > 50 + rsiMargin
+bool strongDown = down and strongTrend and close < fast and minusDI > plusDI and rsi < 50 - rsiMargin
+
+int rawDir = up ? 1 : down ? -1 : 0
+int rawStrong = strongUp or strongDown ? 1 : 0
+bool hold = closedOnly and not barstate.isconfirmed
+int dir = hold ? nz(rawDir[1], 0) : rawDir
+int strong = hold ? nz(rawStrong[1], 0) : rawStrong
+
+float level = dir == 0 ? 0 : showStrength and strong == 0 ? weakLevel : topLevel
+color pulseColour = dir == 1 ? upColour : dir == -1 ? downColour : flatColour
+
+plot(showBaseline ? 0 : na, title="Baseline", color=downColour, linewidth=3)
+plot(level, title="Trend pulse", color=pulseColour, linewidth=3)
+hline(topLevel * 0.4, title="Mid guide", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+
+var label stateTag = na
+if barstate.islast and showLabel
+    string txt = dir == 1 ? "UPTREND" : dir == -1 ? "DOWNTREND" : "NEUTRAL"
+    float y = dir == 0 ? topLevel * 0.4 : level
+    if na(stateTag)
+        stateTag := label.new(bar_index + 1, y, txt, style=label.style_label_left, textcolor=color.white, size=size.normal)
+    label.set_xy(stateTag, bar_index + 1, y)
+    label.set_text(stateTag, txt)
+    label.set_color(stateTag, pulseColour)
+else if not showLabel and not na(stateTag)
+    label.delete(stateTag)
+    stateTag := na
+
+// Alerts fire once the candle that changed state has closed.
+bool confirmed = barstate.isconfirmed
+alertcondition(confirmed and rawDir == 1 and nz(rawDir[1], 0) != 1, title="Uptrend begins", message="Trend pulse turned UP on {{ticker}} {{interval}}. Price-based rules only.")
+alertcondition(confirmed and rawDir == -1 and nz(rawDir[1], 0) != -1, title="Downtrend begins", message="Trend pulse turned DOWN on {{ticker}} {{interval}}. Price-based rules only.")
+alertcondition(confirmed and rawDir == 0 and nz(rawDir[1], 0) != 0, title="Trend ends", message="Trend pulse returned to NEUTRAL on {{ticker}} {{interval}}.")
